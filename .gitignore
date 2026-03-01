@@ -1,3 +1,5 @@
 CMakeFiles/
 CMakeCache.txt
 code
+bookstore.db
+submission_ids.log

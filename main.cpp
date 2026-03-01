@@ -30,6 +30,54 @@ struct ShowFilter {
   string value;
 };
 
+static constexpr uint32_t kDbMagic = 0x424B5354;   // BKST
+static constexpr uint32_t kDbVersion = 1;
+static const char *kDbFileName = "bookstore.db";
+
+template <typename T>
+static bool WriteRaw(ostream &out, const T &value) {
+  out.write(reinterpret_cast<const char *>(&value), sizeof(T));
+  return static_cast<bool>(out);
+}
+
+template <typename T>
+static bool ReadRaw(istream &in, T &value) {
+  in.read(reinterpret_cast<char *>(&value), sizeof(T));
+  return static_cast<bool>(in);
+}
+
+static bool WriteString(ostream &out, const string &s) {
+  uint32_t len = static_cast<uint32_t>(s.size());
+  if (!WriteRaw(out, len)) return false;
+  out.write(s.data(), static_cast<streamsize>(len));
+  return static_cast<bool>(out);
+}
+
+static bool ReadString(istream &in, string &s) {
+  uint32_t len = 0;
+  if (!ReadRaw(in, len)) return false;
+  if (len > 1000000) return false;
+  s.resize(len);
+  in.read(s.data(), static_cast<streamsize>(len));
+  return static_cast<bool>(in);
+}
+
+static bool WriteInt128(ostream &out, __int128 value) {
+  unsigned __int128 u = static_cast<unsigned __int128>(value);
+  uint64_t low = static_cast<uint64_t>(u);
+  uint64_t high = static_cast<uint64_t>(u >> 64);
+  return WriteRaw(out, low) && WriteRaw(out, high);
+}
+
+static bool ReadInt128(istream &in, __int128 &value) {
+  uint64_t low = 0;
+  uint64_t high = 0;
+  if (!ReadRaw(in, low) || !ReadRaw(in, high)) return false;
+  unsigned __int128 u = (static_cast<unsigned __int128>(high) << 64) | static_cast<unsigned __int128>(low);
+  value = static_cast<__int128>(u);
+  return true;
+}
+
 static bool IsAsciiPrintableOrSpace(char c) {
   unsigned char uc = static_cast<unsigned char>(c);
   return uc <= 127 && uc >= 32;
@@ -205,6 +253,106 @@ static bool ParseKeywords(const string &raw, vector<string> &keywords) {
   return true;
 }
 
+static bool SaveState(
+    const unordered_map<string, User> &users,
+    const map<string, Book> &books,
+    const vector<pair<__int128, __int128>> &finance_records) {
+  ofstream out(kDbFileName, ios::binary | ios::trunc);
+  if (!out.is_open()) return false;
+
+  if (!WriteRaw(out, kDbMagic) || !WriteRaw(out, kDbVersion)) return false;
+
+  uint32_t user_count = static_cast<uint32_t>(users.size());
+  if (!WriteRaw(out, user_count)) return false;
+  for (const auto &kv : users) {
+    const string &uid = kv.first;
+    const User &u = kv.second;
+    int32_t priv = u.privilege;
+    if (!WriteString(out, uid) || !WriteString(out, u.password) || !WriteString(out, u.username) ||
+        !WriteRaw(out, priv)) {
+      return false;
+    }
+  }
+
+  uint32_t book_count = static_cast<uint32_t>(books.size());
+  if (!WriteRaw(out, book_count)) return false;
+  for (const auto &kv : books) {
+    const Book &b = kv.second;
+    if (!WriteString(out, b.isbn) || !WriteString(out, b.name) || !WriteString(out, b.author) ||
+        !WriteString(out, b.keyword_raw) || !WriteRaw(out, b.price_cents) || !WriteRaw(out, b.stock)) {
+      return false;
+    }
+  }
+
+  uint32_t finance_count = static_cast<uint32_t>(finance_records.size());
+  if (!WriteRaw(out, finance_count)) return false;
+  for (const auto &txn : finance_records) {
+    if (!WriteInt128(out, txn.first) || !WriteInt128(out, txn.second)) return false;
+  }
+  return static_cast<bool>(out);
+}
+
+static bool LoadState(
+    unordered_map<string, User> &users,
+    map<string, Book> &books,
+    vector<pair<__int128, __int128>> &finance_records) {
+  ifstream in(kDbFileName, ios::binary);
+  if (!in.is_open()) return false;
+
+  uint32_t magic = 0;
+  uint32_t version = 0;
+  if (!ReadRaw(in, magic) || !ReadRaw(in, version)) return false;
+  if (magic != kDbMagic || version != kDbVersion) return false;
+
+  unordered_map<string, User> new_users;
+  map<string, Book> new_books;
+  vector<pair<__int128, __int128>> new_finance;
+
+  uint32_t user_count = 0;
+  if (!ReadRaw(in, user_count)) return false;
+  for (uint32_t i = 0; i < user_count; ++i) {
+    string uid, pwd, uname;
+    int32_t priv = 0;
+    if (!ReadString(in, uid) || !ReadString(in, pwd) || !ReadString(in, uname) || !ReadRaw(in, priv)) {
+      return false;
+    }
+    User u;
+    u.password = std::move(pwd);
+    u.username = std::move(uname);
+    u.privilege = priv;
+    u.login_count = 0;
+    new_users[std::move(uid)] = std::move(u);
+  }
+
+  uint32_t book_count = 0;
+  if (!ReadRaw(in, book_count)) return false;
+  for (uint32_t i = 0; i < book_count; ++i) {
+    Book b;
+    if (!ReadString(in, b.isbn) || !ReadString(in, b.name) || !ReadString(in, b.author) ||
+        !ReadString(in, b.keyword_raw) || !ReadRaw(in, b.price_cents) || !ReadRaw(in, b.stock)) {
+      return false;
+    }
+    if (!b.keyword_raw.empty()) {
+      if (!ParseKeywords(b.keyword_raw, b.keywords)) return false;
+    }
+    new_books[b.isbn] = std::move(b);
+  }
+
+  uint32_t finance_count = 0;
+  if (!ReadRaw(in, finance_count)) return false;
+  new_finance.reserve(finance_count);
+  for (uint32_t i = 0; i < finance_count; ++i) {
+    __int128 in_money = 0, out_money = 0;
+    if (!ReadInt128(in, in_money) || !ReadInt128(in, out_money)) return false;
+    new_finance.push_back({in_money, out_money});
+  }
+
+  users = std::move(new_users);
+  books = std::move(new_books);
+  finance_records = std::move(new_finance);
+  return true;
+}
+
 static string FormatBookLine(const Book &b) {
   string line;
   line.reserve(b.isbn.size() + b.name.size() + b.author.size() + b.keyword_raw.size() + 64);
@@ -242,12 +390,24 @@ int main() {
 
   unordered_map<string, User> users;
   users.reserve(65536);
-  users["root"] = User{"sjtu", "root", 7, 0};
+  map<string, Book> books;
+  vector<pair<__int128, __int128>> finance_records;
+  finance_records.reserve(262144);
+
+  bool loaded_ok = LoadState(users, books, finance_records);
+  if (!loaded_ok) {
+    users.clear();
+    books.clear();
+    finance_records.clear();
+  }
+  if (users.find("root") == users.end()) {
+    users["root"] = User{"sjtu", "root", 7, 0};
+  }
+  for (auto &kv : users) kv.second.login_count = 0;
 
   vector<Session> sessions;
   sessions.reserve(256);
 
-  map<string, Book> books;
   unordered_map<string, set<string>> name_index;
   unordered_map<string, set<string>> author_index;
   unordered_map<string, set<string>> keyword_index;
@@ -259,6 +419,16 @@ int main() {
   vector<__int128> finance_out_prefix(1, 0);
   finance_in_prefix.reserve(262144);
   finance_out_prefix.reserve(262144);
+  for (const auto &kv : books) {
+    const Book &b = kv.second;
+    AddToIndex(name_index, b.name, b.isbn);
+    AddToIndex(author_index, b.author, b.isbn);
+    for (const string &kw : b.keywords) AddToIndex(keyword_index, kw, b.isbn);
+  }
+  for (const auto &txn : finance_records) {
+    finance_in_prefix.push_back(finance_in_prefix.back() + txn.first);
+    finance_out_prefix.push_back(finance_out_prefix.back() + txn.second);
+  }
 
   auto current_priv = [&]() -> int {
     if (sessions.empty()) return 0;
@@ -268,6 +438,7 @@ int main() {
   auto output_invalid = [&]() { cout << "Invalid\n"; };
 
   auto add_finance = [&](const __int128 income, const __int128 expense) {
+    finance_records.push_back({income, expense});
     finance_in_prefix.push_back(finance_in_prefix.back() + income);
     finance_out_prefix.push_back(finance_out_prefix.back() + expense);
   };
@@ -455,7 +626,7 @@ int main() {
             continue;
           }
         }
-        int total_trans = static_cast<int>(finance_in_prefix.size()) - 1;
+        int total_trans = static_cast<int>(finance_records.size());
         if (count == -1) {
           __int128 income = finance_in_prefix.back();
           __int128 expense = finance_out_prefix.back();
@@ -819,5 +990,6 @@ int main() {
     output_invalid();
   }
 
+  SaveState(users, books, finance_records);
   return 0;
 }
